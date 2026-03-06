@@ -795,6 +795,11 @@ class MapViewer(tk.Tk):
         self._sel_end     = None
         self._sel_rect_id = None
 
+        # Messwerkzeug
+        self._measure_mode   = False
+        self._measure_points = []   # Liste von (lat, lon)
+        self._mouse_canvas   = (0, 0)  # letzter Mauszeiger auf Canvas
+
         self._build_ui()
         self._bind_events()
         self.after(200, self._render)
@@ -875,6 +880,28 @@ class MapViewer(tk.Tk):
         self._make_btn(exp, " Beliebigen Bereich exportieren ... ",
                        self._open_bbox_dialog, "#2a4a1e").pack(side=tk.LEFT, padx=4, pady=7)
 
+        tk.Frame(exp, bg="#2a3a5a", width=2).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=8)
+
+        # ── Messwerkzeug ──────────────────────────────────────────────────────
+        tk.Label(exp, text="Messen:", bg=COLORS["toolbar3"],
+                 fg=COLORS["accent"], font=("Helvetica", 10, "bold")).pack(side=tk.LEFT, padx=(4, 4))
+
+        self.measure_btn = self._make_btn(exp, " Linie messen ",
+                                          self._toggle_measure_mode, COLORS["btn"])
+        self.measure_btn.pack(side=tk.LEFT, padx=2, pady=7)
+
+        self._make_btn(exp, " Undo ",
+                       self._measure_undo, COLORS["btn"]).pack(side=tk.LEFT, padx=2, pady=7)
+
+        self._make_btn(exp, " Loeschen ",
+                       self._measure_clear, COLORS["danger"]).pack(side=tk.LEFT, padx=2, pady=7)
+
+        self.measure_info_var = tk.StringVar(value="")
+        tk.Label(exp, textvariable=self.measure_info_var, bg=COLORS["toolbar3"],
+                 fg="#ffee44", font=("Courier", 9, "bold")).pack(side=tk.LEFT, padx=8)
+
+        tk.Frame(exp, bg="#2a3a5a", width=2).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=8)
+
         self.sel_info_var = tk.StringVar(value="Kein Bereich ausgewaehlt")
         tk.Label(exp, textvariable=self.sel_info_var, bg=COLORS["toolbar3"],
                  fg=COLORS["dim"], font=("Helvetica", 9)).pack(side=tk.LEFT, padx=10)
@@ -909,16 +936,24 @@ class MapViewer(tk.Tk):
         c.bind("<MouseWheel>",      self._wheel)
         c.bind("<Button-4>",        self._wheel)
         c.bind("<Button-5>",        self._wheel)
-        c.bind("<Motion>",          self._mouse_coords)
+        c.bind("<Motion>",          self._mouse_move)
         self.bind("<Configure>",    lambda e: self._schedule_render())
         self.bind("<plus>",         lambda e: self._zoom_in())
         self.bind("<minus>",        lambda e: self._zoom_out())
         self.bind("<KP_Add>",       lambda e: self._zoom_in())
         self.bind("<KP_Subtract>",  lambda e: self._zoom_out())
-        self.bind("<Escape>",       lambda e: self._clear_selection())
+        self.bind("<Escape>",       lambda e: (self._clear_selection(), self._measure_clear()))
 
     def _on_press(self, e):
-        if self._export_mode:
+        if self._measure_mode:
+            # Klick: Messpunkt hinzufuegen
+            fx, fy   = self._canvas_to_tile(e.x, e.y)
+            lat, lon = tile2ll(fx, fy, self.zoom)
+            lat      = max(-85.05, min(85.05, lat))
+            self._measure_points.append((lat, lon))
+            self._update_measure_info()
+            self._schedule_render()
+        elif self._export_mode:
             self._sel_start = (e.x, e.y)
             self._sel_end   = (e.x, e.y)
             if self._sel_rect_id:
@@ -1015,6 +1050,182 @@ class MapViewer(tk.Tk):
         self.export_drag_btn.config(state=tk.DISABLED)
         if self._export_mode:
             self._toggle_export_mode()
+
+
+    # ── Messwerkzeug ───────────────────────────────────────────────────────────
+
+    def _toggle_measure_mode(self):
+        """
+        Schaltet den Messmodus ein/aus.
+
+        Im Messmodus wird jeder Linksklick als Messpunkt registriert.
+        Pan ist deaktiviert. Der Cursor wechselt zu einem Kreuz.
+        """
+        self._measure_mode = not self._measure_mode
+        if self._measure_mode:
+            # Andere Modi deaktivieren
+            if self._export_mode:
+                self._toggle_export_mode()
+            self.canvas.config(cursor="crosshair")
+            self.measure_btn.config(bg=COLORS["accent"], fg=COLORS["bg"],
+                                    text=" Messung aktiv ")
+        else:
+            self.canvas.config(cursor="fleur")
+            self.measure_btn.config(bg=COLORS["btn"], fg="white",
+                                    text=" Linie messen ")
+        self._schedule_render()
+
+    def _measure_undo(self):
+        """Entfernt den zuletzt gesetzten Messpunkt."""
+        if self._measure_points:
+            self._measure_points.pop()
+            self._update_measure_info()
+            self._schedule_render()
+
+    def _measure_clear(self):
+        """Loescht alle Messpunkte und beendet den Messmodus."""
+        self._measure_points.clear()
+        self.measure_info_var.set("")
+        if self._measure_mode:
+            self._toggle_measure_mode()
+        self._schedule_render()
+
+    def _update_measure_info(self):
+        """
+        Berechnet die Gesamtstrecke aller Messabschnitte und aktualisiert
+        die Anzeige in der Toolbar.
+        """
+        pts = self._measure_points
+        if len(pts) < 2:
+            self.measure_info_var.set(
+                f"Punkt {len(pts)}/?" if pts else "")
+            return
+        total = sum(
+            haversine_m(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
+            for i in range(len(pts) - 1)
+        )
+        if total >= 1_000_000:
+            label = f"{total/1_000_000:.2f} Mm"
+        elif total >= 1000:
+            label = f"{total/1000:.3f} km"
+        else:
+            label = f"{total:.1f} m"
+        self.measure_info_var.set(
+            f"∑ {label}  ({len(pts)} Punkte)")
+
+    def _draw_measure_overlay(self):
+        """
+        Zeichnet Messpunkte, Verbindungslinien, Segment-Abstände und –
+        im aktiven Messmodus – eine Gummiband-Linie zum Mauszeiger.
+
+        Koordinatenumrechnung:
+            Gespeicherte (lat, lon) → Kachel-Fliesskomma (ll2tile_f)
+            → Canvas-Pixel (relativ zu Bildschirmmitte und offset).
+
+        Visuell:
+            - Gelb gestrichelte Linien zwischen Messpunkten
+            - Rote Punkte mit Buchstaben-Labels (A, B, C, …)
+            - Distanz-Label auf jeder Segmentmitte (m oder km)
+            - Blau gestrichelte Gummiband-Linie zum Cursor
+            - Distanz-Vorschau auf der Gummiband-Linie
+        """
+        pts = self._measure_points
+        if not pts and not self._measure_mode:
+            return
+
+        W = self.canvas.winfo_width()
+        H = self.canvas.winfo_height()
+        CX, CY = W / 2, H / 2
+
+        def ll_to_canvas(lat, lon):
+            """Geografische Koordinaten -> Canvas-Pixelposition."""
+            fx, fy = ll2tile_f(lat, lon, self.zoom)
+            cx = CX + (fx - self.tile_x) * TILE_SIZE - self.offset_x
+            cy = CY + (fy - self.tile_y) * TILE_SIZE - self.offset_y
+            return cx, cy
+
+        canvas_pts = [ll_to_canvas(lat, lon) for lat, lon in pts]
+
+        # ── Verbindungslinien + Segment-Abstände ──────────────────────────────
+        for i in range(1, len(canvas_pts)):
+            x0, y0 = canvas_pts[i-1]
+            x1, y1 = canvas_pts[i]
+
+            # Schatten + gestrichelte Linie
+            self.canvas.create_line(x0, y0, x1, y1,
+                                    fill="#00000099", width=4)
+            self.canvas.create_line(x0, y0, x1, y1,
+                                    fill="#ffdd00", width=2, dash=(10, 5))
+
+            # Segment-Distanz in der Mitte
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            lat0, lon0 = pts[i-1]
+            lat1, lon1 = pts[i]
+            d = haversine_m(lat0, lon0, lat1, lon1)
+            lbl = f"{d/1000:.2f} km" if d >= 1000 else f"{d:.0f} m"
+            # Weisser Hintergrund-Text (Schatten)
+            self.canvas.create_text(mx+1, my+1, text=lbl,
+                                    fill="#000000bb",
+                                    font=("Helvetica", 8, "bold"))
+            self.canvas.create_text(mx, my, text=lbl,
+                                    fill="#ffee44",
+                                    font=("Helvetica", 8, "bold"))
+
+        # ── Gummiband-Linie zum Mauszeiger (nur im aktiven Messmodus) ─────────
+        if self._measure_mode and pts:
+            mx, my = self._mouse_canvas
+            lx, ly = canvas_pts[-1]
+            # Gestrichelte blaue Vorschau-Linie
+            self.canvas.create_line(lx, ly, mx, my,
+                                    fill="#00000066", width=3)
+            self.canvas.create_line(lx, ly, mx, my,
+                                    fill="#44aaff", width=1,
+                                    dash=(6, 4))
+            # Vorschau-Distanz
+            fx, fy   = self._canvas_to_tile(mx, my)
+            mlat, mlon = tile2ll(fx, fy, self.zoom)
+            mlat = max(-85.05, min(85.05, mlat))
+            d    = haversine_m(pts[-1][0], pts[-1][1], mlat, mlon)
+            if d > 0:
+                lbl = f"{d/1000:.2f} km" if d >= 1000 else f"{d:.0f} m"
+                tx, ty = (lx + mx) / 2, (ly + my) / 2
+                self.canvas.create_text(tx+1, ty+1, text=lbl,
+                                        fill="#000000bb",
+                                        font=("Helvetica", 8))
+                self.canvas.create_text(tx, ty, text=lbl,
+                                        fill="#88ccff",
+                                        font=("Helvetica", 8))
+
+        # ── Messpunkte ────────────────────────────────────────────────────────
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for i, (cx, cy) in enumerate(canvas_pts):
+            lbl = labels[i] if i < len(labels) else str(i + 1)
+            r = 6
+            # Aussen-Schatten
+            self.canvas.create_oval(cx-r-1, cy-r-1, cx+r+1, cy+r+1,
+                                    fill="#000000aa", outline="")
+            # Roter Punkt mit weissem Rand
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                    fill="#ff3333",
+                                    outline="white", width=2)
+            # Buchstaben-Label
+            self.canvas.create_text(cx+1, cy-r-9,
+                                    text=lbl, fill="#000000cc",
+                                    font=("Helvetica", 9, "bold"))
+            self.canvas.create_text(cx, cy-r-10,
+                                    text=lbl, fill="white",
+                                    font=("Helvetica", 9, "bold"))
+
+        # ── Hinweis im Messmodus ──────────────────────────────────────────────
+        if self._measure_mode:
+            hint = ("Klick: Punkt setzen  |  Undo: letzten Punkt entfernen"
+                    "  |  Loeschen: alle Punkte  |  Klick auf Messen: Modus beenden")
+            self.canvas.create_text(W / 2 + 1, 22 + 1,
+                                    text=hint, fill="#000000aa",
+                                    font=("Helvetica", 8))
+            self.canvas.create_text(W / 2, 22,
+                                    text=hint, fill="#88ccff",
+                                    font=("Helvetica", 8))
 
     def _open_bbox_dialog(self):
         """Oeffnet den Koordinaten-Export-Dialog (BBoxExportDialog)."""
@@ -1140,13 +1351,18 @@ class MapViewer(tk.Tk):
         if e.num == 4 or (hasattr(e, "delta") and e.delta > 0): self._zoom_in()
         else: self._zoom_out()
 
-    def _mouse_coords(self, e):
+    def _mouse_move(self, e):
+        """Aktualisiert Koordinatenanzeige und – im Messmodus – die Gummiband-Linie."""
         W, H = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if W < 2: return
+        if W < 2:
+            return
         fx, fy   = self._canvas_to_tile(e.x, e.y)
         lat, lon = tile2ll(fx, fy, self.zoom)
         lat      = max(-85.05, min(85.05, lat))
         self.coord_var.set(f"  {lat:+.5f} N   {lon:+.7f} E  ")
+        if self._measure_mode:
+            self._mouse_canvas = (e.x, e.y)
+            self._schedule_render()
 
     def _zoom_in(self):
         if self.zoom < PROVIDERS[self.provider]["max_z"]: self._apply_zoom(self.zoom+1)
@@ -1249,6 +1465,7 @@ class MapViewer(tk.Tk):
         self._draw_scalebar(W, H)
         self._draw_attribution(W, H)
         self._draw_crosshair(W, H)
+        self._draw_measure_overlay()
 
         if self._sel_start and self._sel_end:
             self._sel_rect_id = None
